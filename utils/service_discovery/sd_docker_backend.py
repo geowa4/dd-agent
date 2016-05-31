@@ -32,33 +32,49 @@ class SDDockerBackend(AbstractSDBackend):
             self.config_store = get_config_store(agentConfig=agentConfig)
 
         self.VAR_MAPPING = {
-            'host': self._get_host,
+            'host': self._get_host_addresses,
             'port': self._get_ports,
             'tags': self._get_additional_tags,
         }
+
         AbstractSDBackend.__init__(self, agentConfig)
 
-    def _get_host(self, container_inspect):
-        """Extract the host IP from a docker inspect object, or the kubelet API."""
+    def _get_host_addresses(self, container_inspect):
+        """Extract the container IPs from a docker inspect object, or the kubelet API.
+           Can return a single value or a dict made of networks and IP addresses."""
+        # try to get the bridge IP address, kept for backward compatibility
         ip_addr = container_inspect.get('NetworkSettings', {}).get('IPAddress')
         if not ip_addr:
+            # if none, look for attached networks and return a dict of network names and ip addresses
             if not is_k8s():
-                return
-            # kubernetes case
-            log.debug("Didn't find the IP address for container %s (%s), using the kubernetes way." %
-                      (container_inspect.get('Id', '')[:12], container_inspect.get('Config', {}).get('Image', '')))
-            pod_list = self.kubeutil.retrieve_pods_list().get('items', [])
-            c_id = container_inspect.get('Id')
-            for pod in pod_list:
-                pod_ip = pod.get('status', {}).get('podIP')
-                if pod_ip is None:
-                    continue
-                else:
-                    c_statuses = pod.get('status', {}).get('containerStatuses', [])
-                    for status in c_statuses:
-                        # compare the container id with those of containers in the current pod
-                        if c_id == status.get('containerID', '').split('//')[-1]:
-                            ip_addr = pod_ip
+                networks = container_inspect.get('NetworkSettings', {}).get('Networks')
+
+                # older docker versions don't have networks
+                if not networks:
+                    return None
+
+                ip_addr = {}
+                for net_name, net_desc in networks.iteritems():
+                    ip = net_desc.get('IPAddress')
+                    if ip:
+                        ip_addr[net_name] = ip
+                return ip_addr if ip_addr else None
+            else:
+                # kubernetes case
+                log.debug("Didn't find the IP address for container %s (%s), using the kubernetes way." %
+                          (container_inspect.get('Id', '')[:12], container_inspect.get('Config', {}).get('Image', '')))
+                pod_list = self.kubeutil.retrieve_pods_list().get('items', [])
+                c_id = container_inspect.get('Id')
+                for pod in pod_list:
+                    pod_ip = pod.get('status', {}).get('podIP')
+                    if pod_ip is None:
+                        continue
+                    else:
+                        c_statuses = pod.get('status', {}).get('containerStatuses', [])
+                        for status in c_statuses:
+                            # compare the container id with those of containers in the current pod
+                            if c_id == status.get('containerID', '').split('//')[-1]:
+                                ip_addr = pod_ip
 
         return ip_addr
 
@@ -245,8 +261,8 @@ class SDDockerBackend(AbstractSDBackend):
         return templates
 
     def _fill_tpl(self, inspect, instance_tpl, variables, tags=None):
-        """Add container tags to instance templates and build a """
-        """dict from template variable names and their values."""
+        """Add container tags to instance templates and build a
+           dict from template variable names and their values."""
         var_values = {}
 
         # add default tags to the instance
@@ -262,17 +278,58 @@ class SDDockerBackend(AbstractSDBackend):
                     res = self.VAR_MAPPING[var_parts[0]](inspect)
                     if not res:
                         raise ValueError("Invalid value for variable %s." % var_parts[0])
-                    # if an index is found in the variable, use it to select a value
-                    if len(var_parts) > 1 and isinstance(res, list) and int(var_parts[-1]) < len(res):
-                        var_values[v] = res[int(var_parts[-1])]
-                    # if no valid index was found but we have a list, return the last element
-                    elif isinstance(res, list):
-                        var_values[v] = res[-1]
+
+                    if isinstance(res, list):
+                        var_values[v] = self._process_result_list(res, var_parts)
+                    elif isinstance(res, dict):
+                        var_values[v] = self._process_result_dict(res, var_parts)
                     else:
                         var_values[v] = res
+
                 except Exception as ex:
                     log.error("Could not find a value for the template variable %s: %s" % (v, str(ex)))
             else:
                 log.error("No method was found to interpolate template variable %s." % v)
 
         return instance_tpl, var_values
+
+    def _is_int(self, string):
+        try:
+            return int(string)
+        except ValueError:
+            return False
+
+    def _process_result_list(self, res, var_parts):
+        if len(var_parts) > 1:
+            specifier = var_parts[-1]
+            idx = self._is_int(specifier)
+            # an index was specified
+            if idx is not False and idx < len(res):
+                return res[idx]
+            # the index was invalid
+            else:
+                log.error("Invalid index '%s' for template variable %s. Trying "
+                          "with the last element instead" % (specifier, var_parts[0]))
+                return res[-1]
+        # if no index was passed, also use the last one
+        else:
+            log.warning("No index was passed for template variable %s. "
+                        "Trying with the last element." % var_parts)
+            return res[-1]
+
+    def _process_result_dict(self, res, var_parts):
+        if len(var_parts) > 1:
+            specifier = var_parts[-1]
+            value = res.get(specifier)
+            # if the key didn't bring up anything
+            # order the keys and pick the value of the last one
+            if not value:
+                log.error("Invalid key '%s' for template variable %s. Trying "
+                          "with the last key instead." % (specifier, var_parts[0]))
+                value = res[sorted(res.keys())[-1]]
+        # if no key was passed, also use the last one
+        else:
+            log.warning("No key was passed for template variable %s. "
+                        "Trying with the last key." % var_parts)
+            value = res[sorted(res.keys())[-1]]
+        return value
